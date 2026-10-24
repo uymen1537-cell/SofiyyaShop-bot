@@ -916,8 +916,28 @@ async def deep_start(message: Message, state: FSMContext):
 
 
 async def main():
+    import os
+    from aiohttp import web
+
     await init_db()
     logger.info("Bot ishga tushmoqda...")
+
+    # Render uchun oddiy health-check server (PORT)
+    async def health(request):
+        return web.Response(text="SofiyyaShop bot ishlayapti")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health server PORT={port} da ishga tushdi")
+
+    # Telegram bot polling
     await dp.start_polling(bot)
 
 
