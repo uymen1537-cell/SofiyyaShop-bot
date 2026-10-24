@@ -13,3 +13,7 @@ class OrderProduct(StatesGroup):
     quantity = State()
     confirm_location = State()
     waiting_location = State()
+
+
+class EditProduct(StatesGroup):
+    waiting_value = State()

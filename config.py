@@ -17,14 +17,14 @@ COURIER_IDS = [int(x) for x in os.getenv("COURIER_IDS", "").split(",") if x.stri
 # Kanal ID (masalan: -1001234567890). Bot kanalda admin bo'lishi kerak!
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-# Do'kon lokatsiyasi (Toshkent markazi misol uchun)
-SHOP_LAT = float(os.getenv("SHOP_LAT", "41.311151"))
-SHOP_LON = float(os.getenv("SHOP_LON", "69.279737"))
+# Do'kon / olib ketish punkti lokatsiyasi
+SHOP_LAT = float(os.getenv("SHOP_LAT", "40.7204630"))
+SHOP_LON = float(os.getenv("SHOP_LON", "72.1014191"))
 
 # Yetkazib berish narxlari (so'm)
-DELIVERY_PRICE_PER_KM = int(os.getenv("DELIVERY_PRICE_PER_KM", "3000"))  # 1 km uchun
+DELIVERY_PRICE_PER_KM = int(os.getenv("DELIVERY_PRICE_PER_KM", "2000"))  # 1 km uchun
 MIN_DELIVERY_PRICE = int(os.getenv("MIN_DELIVERY_PRICE", "15000"))      # minimal
-MAX_DELIVERY_KM = float(os.getenv("MAX_DELIVERY_KM", "25"))             # max masofa
+MAX_DELIVERY_KM = float(os.getenv("MAX_DELIVERY_KM", "30"))             # max masofa (30 km)
 
 # Taxminiy yetkazib berish vaqti (daqiqa)
 EST_TIME_MAVJUD = 60          # mavjud mahsulot

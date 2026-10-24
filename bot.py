@@ -17,9 +17,10 @@ from database import (
     init_db, get_or_create_user, add_product, set_channel_message_id,
     get_products_by_category, get_product, create_order, get_order,
     get_new_orders, accept_order, update_order_status, get_user_orders,
-    get_courier_orders
+    get_courier_orders, get_all_products, deactivate_product, activate_product,
+    update_product
 )
-from states import AddProduct, OrderProduct
+from states import AddProduct, OrderProduct, EditProduct
 from keyboards import (
     main_menu_kb, categories_kb, product_kb, category_select_kb,
     confirm_order_kb, location_kb, remove_kb, courier_order_kb,
@@ -325,14 +326,62 @@ async def process_quantity(message: Message, state: FSMContext):
     total_product = product["price"] * qty
 
     await state.update_data(quantity=qty, product_total=total_product)
-    await state.set_state(OrderProduct.waiting_location)
+
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚚 Yetkazib berish", callback_data="delivery_yes")
+    builder.button(text="📍 Tarqatish punktidan olib ketaman", callback_data="pickup_point")
+    builder.button(text="❌ Bekor qilish", callback_data="cancel_order")
+    builder.adjust(1)
 
     await message.answer(
         f"📦 {qty} dona · {format_price(total_product)}\n\n"
-        f"Yetkazib berish uchun <b>lokatsiyangizni</b> yuboring.\n"
-        f"(Xaritadan aniq joyingizni tanlang)",
+        f"Qanday qilib olasiz?",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "delivery_yes")
+async def choose_delivery(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(OrderProduct.waiting_location)
+    await callback.message.answer(
+        "Yetkazib berish uchun <b>lokatsiyangizni</b> yuboring.\n"
+        "(Xaritadan aniq joyingizni tanlang)",
         reply_markup=location_kb()
     )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "pickup_point")
+async def choose_pickup(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    product = data["product"]
+    qty = data["quantity"]
+    product_total = data["product_total"]
+    minutes = est_time(product["category"])
+
+    # Yetkazib berish 0 so'm
+    await state.update_data(
+        lat=SHOP_LAT, lon=SHOP_LON, delivery_price=0, total=product_total,
+        dist=0, estimated_minutes=minutes, is_pickup=True
+    )
+    await state.set_state(OrderProduct.confirm_location)
+
+    await callback.message.answer(
+        f"📍 <b>Tarqatish punkti lokatsiyasi:</b>"
+    )
+    await bot.send_location(callback.from_user.id, SHOP_LAT, SHOP_LON)
+
+    await callback.message.answer(
+        f"📦 {qty} dona · {format_price(product_total)}\n"
+        f"🚚 Yetkazib berish: <b>0 so'm</b> (o'zingiz olasiz)\n"
+        f"━━━━━━━━━━━━\n"
+        f"💵 <b>Jami: {format_price(product_total)}</b>\n"
+        f"⏱ Taxminiy tayyor bo'lish: ~{minutes} daqiqa\n\n"
+        f"Tasdiqlaysizmi?",
+        reply_markup=confirm_order_kb()
+    )
+    await callback.answer()
 
 
 @dp.message(OrderProduct.waiting_location, F.location)
@@ -343,9 +392,10 @@ async def process_location(message: Message, state: FSMContext):
 
     if price is None:
         await message.answer(
-            f"⚠️ Uzr, {dist:.1f} km uzoqlikda yetkazib berish mumkin emas "
-            f"(maksimal {MAX_DELIVERY_KM} km).\n"
-            f"Yaqinroq manzil yuboring yoki /start bosing.",
+            f"⚠️ <b>Uzoq manzil!</b>\n\n"
+            f"Sizning joyingiz olib ketish punktidan <b>{dist:.1f} km</b> uzoqda.\n"
+            f"Biz faqat <b>{int(MAX_DELIVERY_KM)} km</b> gacha yetkazib beramiz.\n\n"
+            f"Iltimos, yaqinroq manzil yuboring yoki tarqatish punktidan olib keting.",
             reply_markup=remove_kb()
         )
         return
@@ -410,7 +460,7 @@ async def confirm_order(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-    # Kuryerlarga xabar
+    # Kuryerlarga xabar (faqat kuryerlarga)
     order = await get_order(order_id)
     text = (
         f"🆕 <b>Yangi buyurtma №{order_id}</b>\n\n"
@@ -421,16 +471,20 @@ async def confirm_order(callback: CallbackQuery, state: FSMContext):
         f"Masofa: {data['dist']:.1f} km"
     )
     from config import COURIER_IDS
-    for cid in set(COURIER_IDS + ADMIN_IDS):
+    # Faqat kuryerlarga (qabul qilish tugmasi bilan)
+    for cid in set(COURIER_IDS):
         try:
-            await bot.send_message(
-                cid, text,
-                reply_markup=courier_order_kb(order_id)
-            )
-            # Lokatsiyani ham yuborish
+            await bot.send_message(cid, text, reply_markup=courier_order_kb(order_id))
             await bot.send_location(cid, order["lat"], order["lon"])
         except Exception as e:
             logger.warning(f"Kuryerga yuborib bo'lmadi {cid}: {e}")
+    # Adminlarga oddiy xabar (tugmasiz)
+    for aid in set(ADMIN_IDS):
+        if aid not in COURIER_IDS:
+            try:
+                await bot.send_message(aid, f"ℹ️ Yangi buyurtma №{order_id} yaratildi.\n{order['product_name']} — {format_price(order['total_price'])}")
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data == "cancel_order")
@@ -604,22 +658,214 @@ async def my_orders(callback: CallbackQuery):
     await callback.answer()
 
 
-# ========== ADMIN PANEL (sodda) ==========
+# ========== ADMIN PANEL ==========
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     new_orders = await get_new_orders()
+    products = await get_all_products()
+    active_count = sum(1 for p in products if p["is_active"])
     text = (
         f"⚙️ <b>Admin panel</b>\n\n"
-        f"Yangi buyurtmalar: {len(new_orders)} ta\n\n"
-        f"Rollarni o'zgartirish uchun:\n"
-        f"/setrole TELEGRAM_ID role\n"
-        f"role: admin | mahsulotchi | courier | customer"
+        f"🆕 Yangi buyurtmalar: {len(new_orders)} ta\n"
+        f"📦 Jami mahsulotlar: {len(products)} ta ({active_count} faol)\n\n"
+        f"Quyidagilardan birini tanlang:"
     )
-    await callback.message.edit_text(text, reply_markup=back_main_kb())
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📦 Mahsulotlarni boshqarish", callback_data="admin_products")
+    builder.button(text="➕ Mahsulot qo'shish", callback_data="add_product")
+    builder.button(text="⬅️ Bosh menyu", callback_data="back_main")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_products")
+async def admin_products(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    products = await get_all_products()
+    if not products:
+        await callback.message.edit_text(
+            "Hozircha mahsulot yo'q.",
+            reply_markup=back_main_kb()
+        )
+        await callback.answer()
+        return
+
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    for p in products[:40]:
+        status = "✅" if p["is_active"] else "❌"
+        builder.button(
+            text=f"{status} {p['name'][:28]} — {p['price']}",
+            callback_data=f"admin_prod_{p['id']}"
+        )
+    builder.button(text="⬅️ Orqaga", callback_data="admin_panel")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"📦 <b>Mahsulotlar ro'yxati</b> ({len(products)} ta)\n"
+        f"Mahsulotni tanlang (tahrirlash / o'chirish):",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_prod_"))
+async def admin_product_detail(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    product_id = int(callback.data.replace("admin_prod_", ""))
+    product = await get_product(product_id)
+    if not product:
+        await callback.answer("Mahsulot topilmadi", show_alert=True)
+        return
+
+    status = "Faol ✅" if product["is_active"] else "O'chirilgan ❌"
+    text = (
+        f"<b>{product['name']}</b>\n\n"
+        f"{product['description'] or 'Tavsif yo‘q'}\n\n"
+        f"💰 Narxi: {format_price(product['price'])}\n"
+        f"📂 {category_name(product['category'])}\n"
+        f"Holat: {status}\n"
+        f"ID: {product['id']}"
+    )
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Nomini o'zgartirish", callback_data=f"edit_name_{product_id}")
+    builder.button(text="💰 Narxini o'zgartirish", callback_data=f"edit_price_{product_id}")
+    builder.button(text="📝 Tavsifini o'zgartirish", callback_data=f"edit_desc_{product_id}")
+    if product["is_active"]:
+        builder.button(text="🗑 O'chirish (yashirish)", callback_data=f"del_prod_{product_id}")
+    else:
+        builder.button(text="✅ Qayta faollashtirish", callback_data=f"act_prod_{product_id}")
+    builder.button(text="⬅️ Orqaga", callback_data="admin_products")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_prod_"))
+async def delete_product_cb(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    product_id = int(callback.data.replace("del_prod_", ""))
+    await deactivate_product(product_id)
+    await callback.answer("Mahsulot yashirildi (o'chirildi)", show_alert=True)
+    # Qayta ko'rsatish
+    product = await get_product(product_id)
+    status = "O'chirilgan ❌"
+    text = (
+        f"<b>{product['name']}</b>\n\n"
+        f"💰 Narxi: {format_price(product['price'])}\n"
+        f"Holat: {status}\n"
+        f"ID: {product['id']}"
+    )
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Qayta faollashtirish", callback_data=f"act_prod_{product_id}")
+    builder.button(text="⬅️ Orqaga", callback_data="admin_products")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("act_prod_"))
+async def activate_product_cb(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    product_id = int(callback.data.replace("act_prod_", ""))
+    await activate_product(product_id)
+    await callback.answer("Mahsulot qayta faollashtirildi", show_alert=True)
+    product = await get_product(product_id)
+    status = "Faol ✅"
+    text = (
+        f"<b>{product['name']}</b>\n\n"
+        f"💰 Narxi: {format_price(product['price'])}\n"
+        f"Holat: {status}\n"
+        f"ID: {product['id']}"
+    )
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗑 O'chirish (yashirish)", callback_data=f"del_prod_{product_id}")
+    builder.button(text="⬅️ Orqaga", callback_data="admin_products")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+
+# ========== MAHSULOT TAHRIRLASH ==========
+@dp.callback_query(F.data.startswith("edit_name_"))
+async def edit_name_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    product_id = int(callback.data.replace("edit_name_", ""))
+    await state.update_data(edit_product_id=product_id, edit_field="name")
+    await state.set_state(EditProduct.waiting_value)
+    await callback.message.answer("Yangi nomni yozing:")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("edit_price_"))
+async def edit_price_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    product_id = int(callback.data.replace("edit_price_", ""))
+    await state.update_data(edit_product_id=product_id, edit_field="price")
+    await state.set_state(EditProduct.waiting_value)
+    await callback.message.answer("Yangi narxni yozing (faqat raqam):")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("edit_desc_"))
+async def edit_desc_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    product_id = int(callback.data.replace("edit_desc_", ""))
+    await state.update_data(edit_product_id=product_id, edit_field="description")
+    await state.set_state(EditProduct.waiting_value)
+    await callback.message.answer("Yangi tavsifni yozing:")
+    await callback.answer()
+
+
+@dp.message(EditProduct.waiting_value)
+async def process_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = data["edit_product_id"]
+    field = data["edit_field"]
+    value = message.text.strip()
+
+    if field == "price":
+        try:
+            value = int(value.replace(" ", "").replace(",", ""))
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("Noto'g'ri narx. Faqat musbat raqam yozing:")
+            return
+        await update_product(product_id, price=value)
+    elif field == "name":
+        await update_product(product_id, name=value)
+    elif field == "description":
+        await update_product(product_id, description=value)
+
+    await state.clear()
+    product = await get_product(product_id)
+    await message.answer(
+        f"✅ Yangilandi!\n\n"
+        f"<b>{product['name']}</b>\n"
+        f"💰 {format_price(product['price'])}\n"
+        f"{product['description'] or ''}",
+        reply_markup=back_main_kb()
+    )
 
 
 @dp.message(Command("setrole"))

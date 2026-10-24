@@ -127,6 +127,54 @@ async def get_product(product_id: int):
         return dict(row) if row else None
 
 
+async def get_all_products(only_active: bool = False):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM products"
+        if only_active:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY id DESC"
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def deactivate_product(product_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE products SET is_active = 0 WHERE id = ?", (product_id,))
+        await db.commit()
+
+
+async def activate_product(product_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE products SET is_active = 1 WHERE id = ?", (product_id,))
+        await db.commit()
+
+
+async def update_product(product_id: int, name: str = None, description: str = None, price: int = None, category: str = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+        if price is not None:
+            updates.append("price = ?")
+            params.append(price)
+        if category is not None:
+            updates.append("category = ?")
+            params.append(category)
+        if not updates:
+            return
+        params.append(product_id)
+        query = f"UPDATE products SET {', '.join(updates)} WHERE id = ?"
+        await db.execute(query, params)
+        await db.commit()
+
+
 async def create_order(user_id: int, product_id: int, quantity: int, product_price: int,
                        delivery_price: int, total: int, lat: float, lon: float,
                        address_text: str, estimated_minutes: int):
