@@ -17,3 +17,7 @@ class OrderProduct(StatesGroup):
 
 class EditProduct(StatesGroup):
     waiting_value = State()
+
+
+class CourierDelivery(StatesGroup):
+    waiting_photo = State()

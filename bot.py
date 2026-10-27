@@ -21,7 +21,7 @@ from database import (
     update_product, get_shop_coords, set_setting, get_admins_from_db,
     update_user_role
 )
-from states import AddProduct, OrderProduct, EditProduct
+from states import AddProduct, OrderProduct, EditProduct, CourierDelivery
 from keyboards import (
     main_menu_kb, categories_kb, product_kb, category_select_kb,
     confirm_order_kb, location_kb, remove_kb, courier_order_kb,
@@ -454,10 +454,15 @@ async def process_location_invalid(message: Message):
     await message.answer("Iltimos, lokatsiya yuboring (📍 tugma orqali).")
 
 
+def order_code(order_id: int) -> str:
+    return f"SF-{order_id:05d}"
+
+
 @dp.callback_query(F.data == "confirm_order", OrderProduct.confirm_location)
 async def confirm_order(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user = await get_or_create_user(callback.from_user.id)
+    is_pickup = data.get("is_pickup", False)
 
     order_id = await create_order(
         user_id=user["id"],
@@ -471,43 +476,68 @@ async def confirm_order(callback: CallbackQuery, state: FSMContext):
         address_text=f"{data['lat']:.5f}, {data['lon']:.5f}",
         estimated_minutes=data["estimated_minutes"]
     )
+    code = order_code(order_id)
     await state.clear()
 
-    await callback.message.edit_text(
-        f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
-        f"Buyurtma №{order_id}\n"
-        f"Jami: {format_price(data['total'])}\n"
-        f"Taxminiy yetkazish: ~{data['estimated_minutes']} daqiqa\n\n"
-        f"Kuryer tez orada bog'lanadi.",
-        reply_markup=back_main_kb()
-    )
+    if is_pickup:
+        customer_text = (
+            f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
+            f"🆔 Kod: <code>{code}</code>\n"
+            f"Buyurtma №{order_id}\n"
+            f"Jami: {format_price(data['total'])}\n\n"
+            f"📍 Tarqatish punktidan olib ketasiz.\n"
+            f"Punktga borganda shu <b>kodni</b> ayting."
+        )
+    else:
+        customer_text = (
+            f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
+            f"🆔 Kod: <code>{code}</code>\n"
+            f"Buyurtma №{order_id}\n"
+            f"Jami: {format_price(data['total'])}\n"
+            f"Taxminiy yetkazish: ~{data['estimated_minutes']} daqiqa\n\n"
+            f"Kuryer tez orada bog'lanadi."
+        )
+
+    await callback.message.edit_text(customer_text, reply_markup=back_main_kb())
     await callback.answer()
 
-    # Kuryerlarga xabar (faqat kuryerlarga)
     order = await get_order(order_id)
+    uname = order.get("user_username") or "—"
     text = (
-        f"🆕 <b>Yangi buyurtma №{order_id}</b>\n\n"
+        f"🆕 <b>Yangi buyurtma</b>\n"
+        f"🆔 Kod: <code>{code}</code>\n"
+        f"№{order_id}\n\n"
         f"📦 {order['product_name']} × {order['quantity']}\n"
-        f"👤 {order['user_name']} (@{order['user_username'] or '—'})\n"
+        f"👤 {order['user_name']} (@{uname})\n"
         f"💰 {format_price(order['total_price'])}\n"
-        f"📍 {order['lat']:.5f}, {order['lon']:.5f}\n"
-        f"Masofa: {data['dist']:.1f} km"
     )
+    if is_pickup:
+        text += "📍 Punktidan olib ketish"
+    else:
+        text += f"📍 {order['lat']:.5f}, {order['lon']:.5f}\nMasofa: {data.get('dist', 0):.1f} km"
+
     from config import COURIER_IDS
-    # Faqat kuryerlarga (qabul qilish tugmasi bilan)
-    for cid in set(COURIER_IDS):
-        try:
-            await bot.send_message(cid, text, reply_markup=courier_order_kb(order_id))
-            await bot.send_location(cid, order["lat"], order["lon"])
-        except Exception as e:
-            logger.warning(f"Kuryerga yuborib bo'lmadi {cid}: {e}")
-    # Adminlarga oddiy xabar (tugmasiz)
-    for aid in set(ADMIN_IDS):
-        if aid not in COURIER_IDS:
+
+    if not is_pickup:
+        for cid in set(COURIER_IDS):
             try:
-                await bot.send_message(aid, f"ℹ️ Yangi buyurtma №{order_id} yaratildi.\n{order['product_name']} — {format_price(order['total_price'])}")
-            except Exception:
-                pass
+                await bot.send_message(cid, text, reply_markup=courier_order_kb(order_id))
+                if order.get("lat") and order.get("lon"):
+                    await bot.send_location(cid, order["lat"], order["lon"])
+            except Exception as e:
+                logger.warning(f"Kuryerga yuborib bo'lmadi {cid}: {e}")
+
+    for aid in set(ADMIN_IDS):
+        try:
+            tip = "📍 Punktidan olib ketish" if is_pickup else "🚚 Yetkazib berish"
+            await bot.send_message(
+                aid,
+                f"ℹ️ Yangi buyurtma\n🆔 Kod: <code>{code}</code>\n"
+                f"№{order_id} — {order['product_name']}\n"
+                f"{format_price(order['total_price'])}\n{tip}"
+            )
+        except Exception:
+            pass
 
 
 @dp.callback_query(F.data == "cancel_order")
@@ -628,22 +658,60 @@ async def set_delivering(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("delivered_"))
-async def set_delivered(callback: CallbackQuery):
+async def set_delivered(callback: CallbackQuery, state: FSMContext):
     order_id = int(callback.data.replace("delivered_", ""))
+    await state.update_data(deliver_order_id=order_id)
+    await state.set_state(CourierDelivery.waiting_photo)
+    code = order_code(order_id)
+    await callback.message.answer(
+        f"📸 Buyurtma <code>{code}</code> (№{order_id}) uchun\n"
+        f"<b>yetkazib berilganlik rasmini</b> yuboring."
+    )
+    await callback.answer()
+
+
+@dp.message(CourierDelivery.waiting_photo, F.photo)
+async def courier_delivery_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get("deliver_order_id")
+    if not order_id:
+        await state.clear()
+        return
     await update_order_status(order_id, "delivered")
     order = await get_order(order_id)
-    await callback.message.edit_text(
-        f"✅ Buyurtma №{order_id} muvaffaqiyatli yetkazib berildi!",
+    code = order_code(order_id)
+    photo_id = message.photo[-1].file_id
+    await state.clear()
+    await message.answer(
+        f"✅ Buyurtma <code>{code}</code> yetkazib berildi deb belgilandi.",
         reply_markup=back_main_kb()
     )
-    await callback.answer("Yaxshi ish!")
-    try:
-        await bot.send_message(
-            order["user_tg_id"],
-            f"✅ Buyurtma №{order_id} yetkazib berildi. Rahmat! 🛍"
-        )
-    except Exception:
-        pass
+    tg_id = order.get("user_telegram_id") or order.get("user_tg_id")
+    if tg_id:
+        try:
+            await bot.send_photo(
+                tg_id,
+                photo=photo_id,
+                caption=(
+                    f"✅ <b>Buyurtmangiz yetkazib berildi!</b>\n"
+                    f"🆔 Kod: <code>{code}</code>\n"
+                    f"Buyurtma №{order_id}\n\n"
+                    f"Rahmat! 🛍"
+                )
+            )
+        except Exception:
+            try:
+                await bot.send_message(
+                    tg_id,
+                    f"✅ Buyurtmangiz yetkazib berildi!\n🆔 Kod: <code>{code}</code>"
+                )
+            except Exception:
+                pass
+
+
+@dp.message(CourierDelivery.waiting_photo)
+async def courier_delivery_photo_invalid(message: Message):
+    await message.answer("Iltimos, rasm yuboring 📸")
 
 
 @dp.callback_query(F.data.startswith("map_"))
