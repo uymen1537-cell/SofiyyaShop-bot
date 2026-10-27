@@ -283,14 +283,19 @@ async def get_new_orders():
         return [dict(r) for r in rows]
 
 
-async def accept_order(order_id: int, courier_id: int):
+async def accept_order(order_id: int, courier_id: int) -> bool:
     pool = await get_pool()
     async with pool.acquire() as conn:
         now = datetime.now().isoformat()
-        await conn.execute(
+        result = await conn.execute(
             "UPDATE orders SET status = 'accepted', courier_id = $1, updated_at = $2 WHERE id = $3 AND status = 'new'",
             courier_id, now, order_id
         )
+        # asyncpg: "UPDATE N"
+        try:
+            return int(result.split()[-1]) > 0
+        except Exception:
+            return False
 
 
 async def update_order_status(order_id: int, status: str):

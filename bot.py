@@ -633,7 +633,7 @@ async def accept_order_cb(callback: CallbackQuery):
     # Mijozga xabar
     try:
         await bot.send_message(
-            order["user_tg_id"],
+            order.get("user_telegram_id") or order.get("user_tg_id"),
             f"🚚 Buyurtma №{order_id} kuryer tomonidan qabul qilindi.\n"
             f"Tez orada yetkazib beriladi."
         )
@@ -652,7 +652,7 @@ async def set_delivering(callback: CallbackQuery):
     )
     await callback.answer()
     try:
-        await bot.send_message(order["user_tg_id"], f"🚚 Buyurtma №{order_id} yo'lda!")
+        await bot.send_message(order.get("user_telegram_id") or order.get("user_tg_id"), f"🚚 Buyurtma №{order_id} yo'lda!")
     except Exception:
         pass
 
