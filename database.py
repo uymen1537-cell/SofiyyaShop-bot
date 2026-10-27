@@ -50,7 +50,47 @@ async def init_db():
                 FOREIGN KEY (product_id) REFERENCES products(id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         await db.commit()
+
+
+async def get_setting(key: str, default: str = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+            (key, value, value)
+        )
+        await db.commit()
+
+
+async def get_shop_coords():
+    from config import SHOP_LAT, SHOP_LON
+    lat = await get_setting("shop_lat")
+    lon = await get_setting("shop_lon")
+    return (
+        float(lat) if lat else SHOP_LAT,
+        float(lon) if lon else SHOP_LON
+    )
+
+
+async def get_admins_from_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT telegram_id, full_name, username FROM users WHERE role = 'admin'") as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
 
 async def get_or_create_user(telegram_id: int, username: str = None, full_name: str = None):

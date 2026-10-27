@@ -18,7 +18,8 @@ from database import (
     get_products_by_category, get_product, create_order, get_order,
     get_new_orders, accept_order, update_order_status, get_user_orders,
     get_courier_orders, get_all_products, deactivate_product, activate_product,
-    update_product
+    update_product, get_shop_coords, set_setting, get_admins_from_db,
+    update_user_role
 )
 from states import AddProduct, OrderProduct, EditProduct
 from keyboards import (
@@ -44,12 +45,21 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def calc_delivery(lat, lon):
-    dist = haversine(SHOP_LAT, SHOP_LON, lat, lon)
+def calc_delivery(lat, lon, shop_lat=None, shop_lon=None):
+    s_lat = shop_lat if shop_lat is not None else SHOP_LAT
+    s_lon = shop_lon if shop_lon is not None else SHOP_LON
+    dist = haversine(s_lat, s_lon, lat, lon)
     if dist > MAX_DELIVERY_KM:
         return None, dist
     price = max(MIN_DELIVERY_PRICE, int(dist * DELIVERY_PRICE_PER_KM))
     return price, dist
+
+
+async def is_admin(telegram_id: int) -> bool:
+    if telegram_id in ADMIN_IDS:
+        return True
+    user = await get_or_create_user(telegram_id)
+    return user.get("role") == "admin"
 
 
 def category_name(cat: str) -> str:
@@ -258,6 +268,8 @@ async def process_category(callback: CallbackQuery, state: FSMContext):
         f"📂 {category_name(cat)}\n\n"
         f"🛒 Sotib olish uchun botga o'ting"
     )
+    channel_ok = False
+    channel_err = ""
     try:
         if CHANNEL_ID:
             msg = await bot.send_photo(
@@ -272,16 +284,25 @@ async def process_category(callback: CallbackQuery, state: FSMContext):
                 ]])
             )
             await set_channel_message_id(product_id, msg.message_id)
+            channel_ok = True
+        else:
+            channel_err = "CHANNEL_ID sozlanmagan"
     except Exception as e:
         logger.error(f"Kanalga yuborishda xato: {e}")
+        channel_err = str(e)
 
-    await callback.message.edit_text(
-        f"✅ Mahsulot qo'shildi!\n\n"
+    text = (
+        f"✅ Mahsulot saqlandi!\n\n"
         f"<b>{data['name']}</b>\n"
         f"{format_price(data['price'])} · {category_name(cat)}\n"
-        f"ID: {product_id}",
-        reply_markup=back_main_kb()
+        f"ID: {product_id}\n"
     )
+    if channel_ok:
+        text += "\n📢 Kanalga joylandi."
+    else:
+        text += f"\n⚠️ Kanalga joylanmadi: {channel_err[:80]}\nBot kanalda admin ekanini tekshiring."
+
+    await callback.message.edit_text(text, reply_markup=back_main_kb())
     await callback.answer("Saqlandi!")
 
 
@@ -359,10 +380,11 @@ async def choose_pickup(callback: CallbackQuery, state: FSMContext):
     qty = data["quantity"]
     product_total = data["product_total"]
     minutes = est_time(product["category"])
+    shop_lat, shop_lon = await get_shop_coords()
 
     # Yetkazib berish 0 so'm
     await state.update_data(
-        lat=SHOP_LAT, lon=SHOP_LON, delivery_price=0, total=product_total,
+        lat=shop_lat, lon=shop_lon, delivery_price=0, total=product_total,
         dist=0, estimated_minutes=minutes, is_pickup=True
     )
     await state.set_state(OrderProduct.confirm_location)
@@ -370,7 +392,7 @@ async def choose_pickup(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"📍 <b>Tarqatish punkti lokatsiyasi:</b>"
     )
-    await bot.send_location(callback.from_user.id, SHOP_LAT, SHOP_LON)
+    await bot.send_location(callback.from_user.id, shop_lat, shop_lon)
 
     await callback.message.answer(
         f"📦 {qty} dona · {format_price(product_total)}\n"
@@ -388,7 +410,8 @@ async def choose_pickup(callback: CallbackQuery, state: FSMContext):
 async def process_location(message: Message, state: FSMContext):
     lat = message.location.latitude
     lon = message.location.longitude
-    price, dist = calc_delivery(lat, lon)
+    shop_lat, shop_lon = await get_shop_coords()
+    price, dist = calc_delivery(lat, lon, shop_lat, shop_lon)
 
     if price is None:
         await message.answer(
@@ -661,31 +684,100 @@ async def my_orders(callback: CallbackQuery):
 # ========== ADMIN PANEL ==========
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     new_orders = await get_new_orders()
     products = await get_all_products()
     active_count = sum(1 for p in products if p["is_active"])
+    shop_lat, shop_lon = await get_shop_coords()
     text = (
         f"⚙️ <b>Admin panel</b>\n\n"
         f"🆕 Yangi buyurtmalar: {len(new_orders)} ta\n"
-        f"📦 Jami mahsulotlar: {len(products)} ta ({active_count} faol)\n\n"
+        f"📦 Jami mahsulotlar: {len(products)} ta ({active_count} faol)\n"
+        f"📍 Punkt: {shop_lat:.5f}, {shop_lon:.5f}\n\n"
         f"Quyidagilardan birini tanlang:"
     )
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     builder = InlineKeyboardBuilder()
     builder.button(text="📦 Mahsulotlarni boshqarish", callback_data="admin_products")
     builder.button(text="➕ Mahsulot qo'shish", callback_data="add_product")
+    builder.button(text="📍 Tarqatish punktini o'zgartirish", callback_data="admin_set_shop")
+    builder.button(text="👤 Adminlarni boshqarish", callback_data="admin_manage")
     builder.button(text="⬅️ Bosh menyu", callback_data="back_main")
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
 
+@dp.callback_query(F.data == "admin_set_shop")
+async def admin_set_shop(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.set_state(EditProduct.waiting_value)
+    await state.update_data(edit_field="shop_location")
+    await callback.message.answer(
+        "📍 Yangi <b>tarqatish punkti</b> lokatsiyasini yuboring.\n"
+        "(Xaritadan joy tanlab, 📎 → Joylashuv orqali yuboring)"
+    )
+    await callback.answer()
+
+
+@dp.message(EditProduct.waiting_value, F.location)
+async def process_shop_location(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get("edit_field") != "shop_location":
+        return
+    lat = message.location.latitude
+    lon = message.location.longitude
+    await set_setting("shop_lat", str(lat))
+    await set_setting("shop_lon", str(lon))
+    await state.clear()
+    await message.answer(
+        f"✅ Tarqatish punkti yangilandi!\n"
+        f"📍 {lat:.6f}, {lon:.6f}",
+        reply_markup=back_main_kb()
+    )
+
+
+@dp.callback_query(F.data == "admin_manage")
+async def admin_manage(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    db_admins = await get_admins_from_db()
+    lines = [f"• {a.get('full_name') or a.get('username') or a['telegram_id']} (<code>{a['telegram_id']}</code>)" for a in db_admins]
+    env_admins = ", ".join(str(x) for x in ADMIN_IDS)
+    text = (
+        f"👤 <b>Adminlar</b>\n\n"
+        f"<b>.env dagi:</b> {env_admins or 'yo‘q'}\n\n"
+        f"<b>Bazadagi adminlar:</b>\n" + ("\n".join(lines) if lines else "yo‘q") +
+        f"\n\nYangi admin qo‘shish: Telegram ID yuboring yoki /setrole ID admin"
+    )
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Admin qo‘shish (ID yuboring)", callback_data="admin_add_prompt")
+    builder.button(text="⬅️ Orqaga", callback_data="admin_panel")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_add_prompt")
+async def admin_add_prompt(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.set_state(EditProduct.waiting_value)
+    await state.update_data(edit_field="add_admin")
+    await callback.message.answer("Yangi adminning <b>Telegram ID</b> raqamini yozing:")
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "admin_products")
 async def admin_products(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     products = await get_all_products()
@@ -717,7 +809,7 @@ async def admin_products(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin_prod_"))
 async def admin_product_detail(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     product_id = int(callback.data.replace("admin_prod_", ""))
@@ -752,7 +844,7 @@ async def admin_product_detail(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_prod_"))
 async def delete_product_cb(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     product_id = int(callback.data.replace("del_prod_", ""))
@@ -777,7 +869,7 @@ async def delete_product_cb(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("act_prod_"))
 async def activate_product_cb(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     product_id = int(callback.data.replace("act_prod_", ""))
@@ -802,7 +894,7 @@ async def activate_product_cb(callback: CallbackQuery):
 # ========== MAHSULOT TAHRIRLASH ==========
 @dp.callback_query(F.data.startswith("edit_name_"))
 async def edit_name_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     product_id = int(callback.data.replace("edit_name_", ""))
@@ -814,7 +906,7 @@ async def edit_name_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("edit_price_"))
 async def edit_price_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     product_id = int(callback.data.replace("edit_price_", ""))
@@ -826,7 +918,7 @@ async def edit_price_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("edit_desc_"))
 async def edit_desc_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not await is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     product_id = int(callback.data.replace("edit_desc_", ""))
@@ -839,9 +931,34 @@ async def edit_desc_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(EditProduct.waiting_value)
 async def process_edit_value(message: Message, state: FSMContext):
     data = await state.get_data()
-    product_id = data["edit_product_id"]
-    field = data["edit_field"]
+    field = data.get("edit_field")
+    if not field or field == "shop_location":
+        return
+    if not message.text:
+        return
     value = message.text.strip()
+
+    # Admin qo'shish
+    if field == "add_admin":
+        try:
+            tg_id = int(value)
+        except ValueError:
+            await message.answer("Faqat raqam yozing (Telegram ID):")
+            return
+        await get_or_create_user(tg_id)
+        await update_user_role(tg_id, "admin")
+        await state.clear()
+        await message.answer(
+            f"✅ <code>{tg_id}</code> admin qilindi.\n"
+            f"U /start bosib Admin panelni ko‘radi.",
+            reply_markup=back_main_kb()
+        )
+        return
+
+    product_id = data.get("edit_product_id")
+    if not product_id:
+        await state.clear()
+        return
 
     if field == "price":
         try:
@@ -870,7 +987,7 @@ async def process_edit_value(message: Message, state: FSMContext):
 
 @dp.message(Command("setrole"))
 async def set_role(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not await is_admin(message.from_user.id):
         return
     parts = message.text.split()
     if len(parts) != 3:
